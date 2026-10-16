@@ -79,6 +79,70 @@ export const MIGRATIONS: string[] = [
 ];
 
 /**
+ * Migrations that rebuild tables referenced by foreign keys must run with foreign key
+ * enforcement switched off (SQLite cannot change that inside a transaction), otherwise
+ * dropping the old table would cascade-delete child rows. Their index is listed here.
+ */
+const MIGRATIONS_WITHOUT_FK = new Set<number>([1]);
+
+// v2 — PocketVault 2.0: pinned/colour/secret items, link previews, voice notes, smart facts.
+MIGRATIONS.push(`
+  CREATE TABLE items_v2 (
+    id TEXT PRIMARY KEY NOT NULL,
+    type TEXT NOT NULL CHECK (type IN ('note','link','image','document','audio')),
+    title TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    url TEXT,
+    canonical_url TEXT,
+    content_text TEXT NOT NULL DEFAULT '',
+    collection_id TEXT REFERENCES collections(id) ON DELETE SET NULL,
+    is_favorite INTEGER NOT NULL DEFAULT 0,
+    is_pinned INTEGER NOT NULL DEFAULT 0,
+    color TEXT,
+    is_secret INTEGER NOT NULL DEFAULT 0,
+    secret_payload TEXT,
+    ocr_status TEXT NOT NULL DEFAULT 'none',
+    ocr_error TEXT,
+    preview_status TEXT NOT NULL DEFAULT 'none',
+    preview_title TEXT,
+    preview_description TEXT,
+    preview_site TEXT,
+    reader_text TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'manual',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  INSERT INTO items_v2 (id, type, title, note, url, content_text, collection_id, is_favorite, ocr_status, ocr_error, source, created_at, updated_at,
+                        preview_status)
+    SELECT id, type, title, note, url, content_text, collection_id, is_favorite, ocr_status, ocr_error, source, created_at, updated_at,
+           CASE WHEN type = 'link' AND url IS NOT NULL THEN 'pending' ELSE 'none' END
+    FROM items;
+  DROP TABLE items;
+  ALTER TABLE items_v2 RENAME TO items;
+  CREATE INDEX idx_items_updated ON items(updated_at DESC);
+  CREATE INDEX idx_items_collection ON items(collection_id);
+  CREATE INDEX idx_items_favorite ON items(is_favorite);
+  CREATE INDEX idx_items_pinned ON items(is_pinned);
+  CREATE INDEX idx_items_secret ON items(is_secret);
+  CREATE INDEX idx_items_canonical ON items(canonical_url);
+  CREATE INDEX idx_items_created ON items(created_at);
+
+  ALTER TABLE attachments ADD COLUMN role TEXT NOT NULL DEFAULT 'file';
+  ALTER TABLE attachments ADD COLUMN duration_ms INTEGER;
+  ALTER TABLE attachments ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0;
+
+  CREATE TABLE item_facts (
+    item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    num REAL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX idx_item_facts_item ON item_facts(item_id);
+  CREATE INDEX idx_item_facts_kind ON item_facts(kind, num);
+`);
+
+/**
  * The full-text index is derived data and lives outside the versioned schema: it is
  * created when the SQLite build supports FTS5 (Android/iOS) and rebuilt from the items
  * table when missing. Builds without FTS5 (e.g. the web wasm build) fall back to LIKE.
@@ -130,10 +194,21 @@ export async function migrate(db: Database): Promise<number> {
   while (version < SCHEMA_VERSION) {
     const sql = MIGRATIONS[version];
     const target = version + 1;
-    await db.transaction(async () => {
-      await db.exec(sql);
-      await db.exec(`PRAGMA user_version = ${target}`);
-    });
+    const withoutFk = MIGRATIONS_WITHOUT_FK.has(version);
+    if (withoutFk) await db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      await db.transaction(async () => {
+        await db.exec(sql);
+        if (withoutFk) {
+          // Refuse to commit a rebuild that left dangling references.
+          const broken = await db.all<{ table: string }>('PRAGMA foreign_key_check');
+          if (broken.length) throw new Error(`Migration to v${target} broke ${broken.length} foreign key(s)`);
+        }
+        await db.exec(`PRAGMA user_version = ${target}`);
+      });
+    } finally {
+      if (withoutFk) await db.exec('PRAGMA foreign_keys = ON');
+    }
     version = target;
   }
   return version;

@@ -1,22 +1,24 @@
-# Stash
+# PocketVault
 
 An offline-first Android app (Expo SDK 57 / React Native 0.86, TypeScript) for saving notes, links, images and documents, with collections, tags, favorites, full-text search, on-device OCR, reminders and local backups. Nothing leaves the device; no account or network service is required.
 
 ## Features
 
-- **Save anything**: notes, links, images (multi-select from the photo picker) and documents (any file type).
-- **Share into the app** from any Android app (text, URLs, images, files — single or multiple).
-- **Organize**: collections (create/rename/delete — items are kept), tags (assign/rename/delete), favorites.
-- **Search** titles, notes, URLs, tags, attachment names, OCR text and text-document contents (SQLite FTS5, prefix matching, all terms required).
-- **OCR**: on-device ML Kit text recognition (bundled Latin model, works offline) with status, error display and retry.
-- **Reminders**: presets or a custom date/time; edit, complete, cancel; local notifications that open the item; works (in-app only) when notification permission is denied.
-- **Backup/restore**: single JSON file (records, relationships, attachments, settings) saved to a chosen folder or shared; restore replaces data atomically.
-- **Themes**: system / light / dark.
+- **Capture**: notes (checklists, headings, bold), links, photos, documents, document scans (ML Kit scanner → PDF + OCR), voice notes (on-device transcript on Android 13+), share-to-app with optional Quick Save, home-screen widget.
+- **Organize**: collections, tags, favorites, pins, colour labels, swipe actions, list and masonry grid views.
+- **Find**: SQLite FTS5 search plus Smart Search ("receipts over 500 last month", "links this week", "#tag", "in:Collection").
+- **Smart**: on-device OCR, detected facts (totals, dates, phones, emails, links) with one-tap Smart Actions, spending and activity Insights, daily Rediscover.
+- **Links**: rich previews (title, site, image) and an offline reader copy, fetched when online; duplicate-link warning.
+- **Private**: fully offline core, app lock (biometric / screen lock), AES-256-GCM secret vault with a Keystore key, password-protected and automatic weekly backups.
+- **Reminders**: presets or custom time, local notifications that open the item.
 
 ## Project layout
 
 ```
-src/app/          expo-router screens (_layout, index, item/[id], edit, shareintent, collections, tags, reminders, settings, onboarding)
+src/app/          expo-router screens (home, item/[id], edit, record, scan, reader, vault, insights, shareintent, collections, tags, reminders, settings, onboarding)
+src/capture/      document scanner + PDF
+src/security/     biometric app lock
+src/widgets/      Android home-screen widget (registered in index.ts)
 src/components/   UI kit, dialogs/toasts, sheets, item card, tag/collection pickers, date picker (native + web)
 src/db/           SQLite adapter, migrations, repository (all SQL), FTS query builder
 src/services/     AppServices (coordinates DB + files + notifications + OCR), backup, file store, platform adapters
@@ -72,11 +74,18 @@ cd android && ./gradlew assembleDebug -PreactNativeArchitectures=x86_64 --max-wo
 ### Development notes
 
 - `CI=1 npx expo start` disables Metro's file watcher — restart it after code changes.
-- Android won't let apps pick the top-level `Download` folder for folder access; create or choose a subfolder (e.g. `Download/Stash backups`) when saving a backup.
+- Android won't let apps pick the top-level `Download` folder for folder access; create or choose a subfolder (e.g. `Download/PocketVault backups`) when saving a backup.
+
+## Release & distribution
+
+- **Package ID:** `com.sagarsamanta.pocketvault` (permanent once published).
+- **Signing:** `plugins/withReleaseSigning.js` signs release builds with an upload keystore kept outside the repo. It reads `POCKETVAULT_SIGNING_PROPERTIES` or `../keystores/pocketvault-signing.properties` (keys: `storeFile`, `storePassword`, `keyAlias`, `keyPassword`). Without it, release builds fall back to the debug key and print a warning.
+- **Build everything:** `npm run build:android:release` → per-ABI + universal APKs in `android/app/build/outputs/apk/release/` and the Play bundle in `android/app/build/outputs/bundle/release/app-release.aab`.
+- **Store material:** `store/` (listing text, data-safety answers, release notes, icon, feature graphic, screenshots, step-by-step guides) and `docs/privacy-policy.md` (served via GitHub Pages).
 
 ## Known limitations
 
-- When sharing into Stash, the page title is read from `EXTRA_TITLE`; apps that only send `EXTRA_SUBJECT` produce a title derived from the shared text instead.
+- When sharing into PocketVault, the page title is read from `EXTRA_TITLE`; apps that only send `EXTRA_SUBJECT` produce a title derived from the shared text instead.
 
 - PDF and Office documents are stored and can be opened/shared, but their text is not extracted for search (plain-text formats are indexed).
 - OCR covers Latin script only.

@@ -42,3 +42,7 @@ export function writeCacheFile(name: string, text: string): string {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
   return '';
 }
+
+export async function pickBackupFolder(): Promise<{ uri: string; label: string } | null> {
+  return null;
+}

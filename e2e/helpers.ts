@@ -10,7 +10,7 @@ export async function openFresh(page: Page) {
 export async function completeOnboarding(page: Page) {
   await expect(page.getByTestId('onboarding')).toBeVisible();
   for (let i = 0; i < 3; i++) await page.getByTestId('onboarding-next').click();
-  await expect(page.getByTestId('onboarding-next')).toHaveText('Get started');
+  await expect(page.getByTestId('onboarding-next')).toContainText('Get started');
   await page.getByTestId('onboarding-next').click();
   await expect(page.getByTestId('search-input')).toBeVisible();
 }
@@ -23,7 +23,7 @@ export async function start(page: Page) {
 
 export async function createNote(page: Page, title: string, note = '', tags: string[] = []) {
   await page.getByTestId('fab-add').click();
-  await page.getByTestId('add-note').click();
+  await page.getByTestId('fab-note').click();
   await page.getByTestId('input-title').fill(title);
   if (note) await page.getByTestId('input-note').fill(note);
   for (const t of tags) {
@@ -38,7 +38,7 @@ export async function createNote(page: Page, title: string, note = '', tags: str
 
 export async function createLink(page: Page, url: string, title = '') {
   await page.getByTestId('fab-add').click();
-  await page.getByTestId('add-link').click();
+  await page.getByTestId('fab-link').click();
   await page.getByTestId('input-url').fill(url);
   if (title) await page.getByTestId('input-title').fill(title);
   await page.getByTestId('save-item').click();

@@ -1,7 +1,7 @@
 import { Directory, File, Paths } from 'expo-file-system';
 import { FileStore } from './fileStore';
 
-const ROOT_NAME = 'stash';
+const ROOT_NAME = 'pocketvault';
 
 function rootDir(): Directory {
   const dir = new Directory(Paths.document, ROOT_NAME);
@@ -102,4 +102,17 @@ export function writeCacheFile(name: string, text: string): string {
   f.create();
   f.write(text, { encoding: 'utf8' });
   return f.uri;
+}
+
+/** Lets the user choose the folder for automatic backups. Returns null if cancelled. */
+export async function pickBackupFolder(): Promise<{ uri: string; label: string } | null> {
+  try {
+    const dir = await Directory.pickDirectoryAsync();
+    if (!dir) return null;
+    const decoded = decodeURIComponent(dir.uri);
+    const label = decoded.split(/[:/]/).filter(Boolean).pop() ?? 'Selected folder';
+    return { uri: dir.uri, label };
+  } catch {
+    return null;
+  }
 }

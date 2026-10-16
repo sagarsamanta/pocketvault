@@ -1,4 +1,5 @@
-import type { Attachment, Collection, Item, Reminder, Tag } from './types';
+import { ITEM_COLORS } from './types';
+import type { Attachment, Collection, Item, ItemColor, ItemFact, Reminder, Tag } from './types';
 
 export interface ItemRow {
   id: string;
@@ -6,11 +7,21 @@ export interface ItemRow {
   title: string;
   note: string;
   url: string | null;
+  canonical_url: string | null;
   content_text: string;
   collection_id: string | null;
   is_favorite: number;
+  is_pinned: number;
+  color: string | null;
+  is_secret: number;
+  secret_payload: string | null;
   ocr_status: Item['ocrStatus'];
   ocr_error: string | null;
+  preview_status: Item['previewStatus'];
+  preview_title: string | null;
+  preview_description: string | null;
+  preview_site: string | null;
+  reader_text: string;
   source: Item['source'];
   created_at: number;
   updated_at: number;
@@ -23,7 +34,17 @@ export interface AttachmentRow {
   original_name: string;
   mime_type: string;
   size: number;
+  role: Attachment['role'];
+  duration_ms: number | null;
+  encrypted: number;
   created_at: number;
+}
+
+export interface FactRow {
+  item_id: string;
+  kind: ItemFact['kind'];
+  value: string;
+  num: number | null;
 }
 
 export interface CollectionRow {
@@ -58,11 +79,20 @@ export const toItem = (r: ItemRow): Item => ({
   title: r.title,
   note: r.note,
   url: r.url,
+  canonicalUrl: r.canonical_url,
   contentText: r.content_text,
   collectionId: r.collection_id,
   isFavorite: r.is_favorite === 1,
+  isPinned: r.is_pinned === 1,
+  color: (ITEM_COLORS as readonly string[]).includes(r.color ?? '') ? (r.color as ItemColor) : null,
+  isSecret: r.is_secret === 1,
   ocrStatus: r.ocr_status,
   ocrError: r.ocr_error,
+  previewStatus: r.preview_status,
+  previewTitle: r.preview_title,
+  previewDescription: r.preview_description,
+  previewSite: r.preview_site,
+  readerText: r.reader_text,
   source: r.source,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
@@ -75,8 +105,13 @@ export const toAttachment = (r: AttachmentRow): Attachment => ({
   originalName: r.original_name,
   mimeType: r.mime_type,
   size: r.size,
+  role: r.role ?? 'file',
+  durationMs: r.duration_ms ?? null,
+  encrypted: r.encrypted === 1,
   createdAt: r.created_at,
 });
+
+export const toFact = (r: FactRow): ItemFact => ({ kind: r.kind, value: r.value, num: r.num });
 
 export const toCollection = (r: CollectionRow): Collection => ({
   id: r.id,

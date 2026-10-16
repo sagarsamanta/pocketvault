@@ -13,9 +13,35 @@ import {
   isTextDocument,
   sanitizeFileName,
 } from '../lib/text';
-import { BackupSummary, createBackup, parseBackup, recoverInterruptedRestore, restoreBackup } from './backup';
+import { decryptWithPassword, DecryptionError, encryptWithPassword, isEncryptedEnvelope } from '../lib/crypto';
+import { extractFacts } from '../lib/facts';
+import { BackupError, BackupSummary, createBackup, parseBackup, recoverInterruptedRestore, restoreBackup } from './backup';
 import { FileStore, attachmentPath } from './fileStore';
-import type { IncomingFile, Notifier, OcrEngine } from './types';
+import { PreviewService } from './previews';
+import type { BackupWriter, IncomingFile, NetworkMonitor, Notifier, OcrEngine, PageFetcher, SecretKeyStore } from './types';
+import { VaultService } from './vault';
+
+/** Optional platform capabilities; tests and the web build may omit any of them. */
+export interface ServiceExtras {
+  keyStore?: SecretKeyStore;
+  fetcher?: PageFetcher;
+  network?: NetworkMonitor;
+  backupWriter?: BackupWriter;
+}
+
+export const SETTINGS = {
+  appLock: 'app_lock',
+  lockTimeout: 'lock_timeout_s',
+  quickSave: 'quick_save',
+  viewMode: 'view_mode',
+  autoBackupUri: 'auto_backup_uri',
+  autoBackupLabel: 'auto_backup_label',
+  lastAutoBackup: 'last_auto_backup',
+  factsBackfilled: 'facts_backfilled_v2',
+  previewsBackfilled: 'previews_backfilled_v2',
+} as const;
+
+const WEEK = 7 * 86_400_000;
 
 type Listener = () => void;
 
@@ -30,6 +56,7 @@ const MAX_TEXT_DOC_BYTES = 2 * 1024 * 1024;
 
 /** Default title for images whose file name carries no meaning (camera/picker names). */
 export const DEFAULT_IMAGE_TITLE = 'Photo';
+export const DEFAULT_SCAN_TITLE = 'Scanned document';
 
 /** Camera and photo-picker names such as "1000000019.png", "IMG_20240101_1200.jpg" or "PXL_…". */
 export function isGenericImageName(name: string): boolean {
@@ -43,6 +70,8 @@ export function isGenericImageName(name: string): boolean {
 export class AppServices {
   private listeners = new Set<Listener>();
   private ocrChain: Promise<void> = Promise.resolve();
+  readonly vault: VaultService;
+  readonly previews: PreviewService;
 
   constructor(
     readonly db: Database,
@@ -50,8 +79,12 @@ export class AppServices {
     readonly files: FileStore,
     readonly notifier: Notifier,
     readonly ocr: OcrEngine,
+    readonly extras: ServiceExtras = {},
     private readonly now: () => number = Date.now,
-  ) {}
+  ) {
+    this.vault = new VaultService(this);
+    this.previews = new PreviewService(this);
+  }
 
   // ------------------------------------------------------------- events
 
@@ -72,9 +105,37 @@ export class AppServices {
     await this.removeOrphanFiles();
     // OCR that was running when the app was killed is retried.
     for (const item of await this.repo.listItemsByOcrStatus(['processing'])) {
-      await this.repo.updateItem(item.id, { ocrStatus: 'pending' });
+      await this.repo.updateItem(item.id, { ocrStatus: 'pending' }, { touch: false });
     }
+    await this.vault.clearCache().catch(() => undefined);
+    if (this.vault.supported) await this.vault.resealPending().catch(() => undefined);
+    await this.backfillV2().catch(() => undefined);
     void this.processOcrQueue();
+    void this.previews.processQueue();
+    void this.runAutoBackupIfDue().catch(() => undefined);
+  }
+
+  /** One-time work after upgrading to 2.0: detect facts in existing items. */
+  private async backfillV2() {
+    if ((await this.repo.getSetting(SETTINGS.factsBackfilled)) !== '1') {
+      const rows = await this.db.all<{ id: string }>('SELECT id FROM items WHERE is_secret = 0');
+      for (const { id } of rows) await this.refreshFacts(id);
+      await this.repo.setSetting(SETTINGS.factsBackfilled, '1');
+    }
+    if ((await this.repo.getSetting(SETTINGS.previewsBackfilled)) !== '1') {
+      await this.db.run(
+        "UPDATE items SET preview_status = 'pending' WHERE type = 'link' AND url IS NOT NULL AND is_secret = 0 AND preview_status = 'none'",
+      );
+      await this.repo.setSetting(SETTINGS.previewsBackfilled, '1');
+    }
+  }
+
+  /** Re-detects amounts, dates, phones, emails and links in an item's text. */
+  async refreshFacts(itemId: string): Promise<void> {
+    const item = await this.repo.getItem(itemId);
+    if (!item || item.isSecret) return;
+    const text = [item.contentText, item.note, item.title].filter(Boolean).join('\n');
+    await this.repo.setItemFacts(itemId, extractFacts(text));
   }
 
   /** Deletes attachment files left behind by an import that was interrupted before saving. */
@@ -95,14 +156,25 @@ export class AppServices {
 
   async createItem(input: NewItemInput): Promise<Item> {
     const item = await this.repo.createItem(input);
+    await this.refreshFacts(item.id);
     this.notifyChanged();
+    if (item.previewStatus === 'pending') void this.previews.processQueue();
     return item;
   }
 
   async updateItem(id: string, patch: ItemPatch): Promise<Item> {
     const item = await this.repo.updateItem(id, patch);
+    if (patch.title !== undefined || patch.note !== undefined || patch.contentText !== undefined) {
+      await this.refreshFacts(id);
+    }
     this.notifyChanged();
+    if (item.previewStatus === 'pending') void this.previews.processQueue();
     return item;
+  }
+
+  /** Other saved items that point to the same web page. */
+  findDuplicateLinks(url: string, excludeId?: string): Promise<Item[]> {
+    return this.repo.findByCanonicalUrl(url, excludeId);
   }
 
   async setTags(id: string, names: string[]) {
@@ -180,6 +252,7 @@ export class AppServices {
           [attachment],
         );
         created.push(item);
+        if (contentText) await this.refreshFacts(item.id);
       } catch (error) {
         await this.files.delete(path).catch(() => undefined);
         for (const item of created) await this.deleteItem(item.id).catch(() => undefined);
@@ -219,37 +292,123 @@ export class AppServices {
 
   private async runOcr(itemId: string) {
     const item = await this.repo.getItemWithRelations(itemId);
-    if (!item) return;
-    const image = item.attachments.find((a) => isImageMime(a.mimeType, a.originalName));
-    if (!image) {
-      await this.repo.updateItem(itemId, { ocrStatus: 'failed', ocrError: 'No image attached.' });
+    if (!item || item.isSecret) return;
+    // Scanned documents have one image per page; photos have a single image.
+    const images = item.attachments.filter(
+      (a) => a.role !== 'preview' && !a.encrypted && isImageMime(a.mimeType, a.originalName),
+    );
+    if (images.length === 0) {
+      await this.repo.updateItem(itemId, { ocrStatus: 'failed', ocrError: 'No image attached.' }, { touch: false });
       this.notifyChanged();
       return;
     }
-    await this.repo.updateItem(itemId, { ocrStatus: 'processing', ocrError: null });
+    await this.repo.updateItem(itemId, { ocrStatus: 'processing', ocrError: null }, { touch: false });
     this.notifyChanged();
     try {
-      const path = attachmentPath(image.fileName);
-      if (!(await this.files.exists(path))) throw new Error('The image file is missing.');
-      const text = (await this.ocr.recognize(this.files.uri(path))).trim();
+      const pages: string[] = [];
+      for (const image of images) {
+        const path = attachmentPath(image.fileName);
+        if (!(await this.files.exists(path))) throw new Error('The image file is missing.');
+        pages.push((await this.ocr.recognize(this.files.uri(path))).trim());
+      }
+      const text = pages.filter(Boolean).join('\n\n');
       // The item may have been deleted (or renamed) while OCR ran.
       const current = await this.repo.getItem(itemId);
-      if (!current) return;
+      if (!current || current.isSecret) return;
       // Replace a placeholder title with the first line of recognized text.
-      const placeholder = current.title === DEFAULT_IMAGE_TITLE || current.title === image.originalName || !current.title;
+      const placeholder =
+        !current.title ||
+        current.title === DEFAULT_IMAGE_TITLE ||
+        current.title === DEFAULT_SCAN_TITLE ||
+        current.title === images[0].originalName;
       const ocrTitle = placeholder && text ? deriveTitle(text) : '';
-      await this.repo.updateItem(itemId, {
-        contentText: text,
-        ocrStatus: 'done',
-        ocrError: null,
-        ...(ocrTitle ? { title: ocrTitle } : {}),
-      });
+      await this.repo.updateItem(
+        itemId,
+        { contentText: text, ocrStatus: 'done', ocrError: null, ...(ocrTitle ? { title: ocrTitle } : {}) },
+        { touch: false },
+      );
+      await this.refreshFacts(itemId);
     } catch (error) {
       if (!(await this.repo.getItem(itemId))) return;
       const message = (error as Error)?.message || 'Text recognition failed.';
-      await this.repo.updateItem(itemId, { ocrStatus: 'failed', ocrError: message.slice(0, 300) });
+      await this.repo.updateItem(itemId, { ocrStatus: 'failed', ocrError: message.slice(0, 300) }, { touch: false });
     }
     this.notifyChanged();
+  }
+
+  // ------------------------------------------------------------ capture
+
+  private async storeFile(uri: string, name: string, mimeType: string, role: 'file' | 'page' | 'audio', durationMs?: number) {
+    const id = newId();
+    const ext = fileExtension(name) || 'bin';
+    const fileName = `${id}.${ext}`;
+    const size = await this.files.copyIn(uri, attachmentPath(fileName));
+    const att: NewAttachmentInput = { id, fileName, originalName: name, mimeType, size, role, durationMs: durationMs ?? null };
+    return att;
+  }
+
+  /** Saves a recorded voice note; the transcript (if any) becomes searchable text. */
+  async createVoiceNote(input: {
+    uri: string;
+    mimeType: string;
+    durationMs: number;
+    transcript?: string;
+    extra?: Partial<NewItemInput>;
+  }): Promise<Item> {
+    if (!this.files.supported) throw new ValidationError('Voice notes are only available in the Android app.');
+    const ext = fileExtension(input.uri.split('?')[0]) || (input.mimeType.includes('wav') ? 'wav' : 'm4a');
+    const att = await this.storeFile(input.uri, `voice-note.${ext}`, input.mimeType, 'audio', input.durationMs);
+    const transcript = (input.transcript ?? '').trim();
+    try {
+      const item = await this.repo.createItem(
+        {
+          ...input.extra,
+          type: 'audio',
+          title: input.extra?.title?.trim() || deriveTitle(transcript, 60) || 'Voice note',
+          contentText: transcript,
+          source: 'manual',
+        },
+        [att],
+      );
+      if (transcript) await this.refreshFacts(item.id);
+      this.notifyChanged();
+      return item;
+    } catch (error) {
+      await this.files.delete(attachmentPath(att.fileName)).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Saves scanned pages as one document: a PDF (when provided) plus the page images,
+   * which are OCR'd so the scan becomes searchable.
+   */
+  async createScan(input: { pageUris: string[]; pdfUri?: string | null; extra?: Partial<NewItemInput> }): Promise<Item> {
+    if (!this.files.supported) throw new ValidationError('Scanning is only available in the Android app.');
+    if (input.pageUris.length === 0) throw new ValidationError('No pages were scanned.');
+    const stored: NewAttachmentInput[] = [];
+    try {
+      if (input.pdfUri) stored.push(await this.storeFile(input.pdfUri, 'scan.pdf', 'application/pdf', 'file'));
+      for (let i = 0; i < input.pageUris.length; i++) {
+        stored.push(await this.storeFile(input.pageUris[i], `page-${i + 1}.jpg`, 'image/jpeg', 'page'));
+      }
+      const item = await this.repo.createItem(
+        {
+          ...input.extra,
+          type: 'document',
+          title: input.extra?.title?.trim() || DEFAULT_SCAN_TITLE,
+          ocrStatus: this.ocr.supported ? 'pending' : 'none',
+          source: 'manual',
+        },
+        stored,
+      );
+      this.notifyChanged();
+      void this.processOcrQueue();
+      return item;
+    } catch (error) {
+      for (const a of stored) await this.files.delete(attachmentPath(a.fileName)).catch(() => undefined);
+      throw error;
+    }
   }
 
   // ---------------------------------------------------------- reminders
@@ -259,7 +418,7 @@ export class AppServices {
     const permission = await this.notifier.getPermission();
     if (permission !== 'granted') return null;
     const item = await this.repo.getItem(reminder.itemId);
-    const title = item?.title || item?.url || 'Stash reminder';
+    const title = item?.title || item?.url || 'PocketVault reminder';
     const body = item?.note?.trim().slice(0, 120) || 'Tap to open your saved item.';
     try {
       return await this.notifier.schedule({
@@ -346,31 +505,88 @@ export class AppServices {
 
   // ------------------------------------------------------------- backup
 
-  async exportBackupJson(appVersion?: string): Promise<{ json: string; summary: BackupSummary }> {
-    const backup = await createBackup(this.db, this.files, appVersion);
-    return {
-      json: JSON.stringify(backup),
-      summary: {
-        items: backup.tables.items.length,
-        collections: backup.tables.collections.length,
-        tags: backup.tables.tags.length,
-        reminders: backup.tables.reminders.length,
-        attachments: backup.tables.attachments.length,
-        missingFiles: backup.missingFiles.length,
-      },
+  /**
+   * Exports a backup. With a password the file is encrypted (PBKDF2 + AES-256-GCM) and
+   * also contains secret items; without one, secret items are left out.
+   */
+  async exportBackupJson(
+    appVersion?: string,
+    options: { password?: string } = {},
+  ): Promise<{ json: string; summary: BackupSummary }> {
+    const secrets =
+      options.password && this.vault.supported && (await this.repo.countSecretItems()) > 0
+        ? {
+            decryptItem: (row: Record<string, string | number | null>) => this.vault.decryptForBackup(row),
+            decryptFile: (fileName: string) => this.vault.decryptFileForBackup(fileName),
+          }
+        : undefined;
+    const backup = await createBackup(this.db, this.files, appVersion, secrets);
+    const plain = JSON.stringify(backup);
+    const summary: BackupSummary = {
+      items: backup.tables.items.length,
+      collections: backup.tables.collections.length,
+      tags: backup.tables.tags.length,
+      reminders: backup.tables.reminders.length,
+      attachments: backup.tables.attachments.length,
+      missingFiles: backup.missingFiles.length,
+      secretItems: backup.tables.items.filter((r) => Number(r.is_secret) === 1).length,
+      excludedSecrets: backup.excludedSecrets ?? 0,
     };
+    return { json: options.password ? await encryptWithPassword(plain, options.password) : plain, summary };
   }
 
-  async restoreBackupJson(json: string): Promise<BackupSummary> {
-    const backup = parseBackup(json);
+  /** True when the file is a password-protected backup. */
+  isEncryptedBackup(json: string): boolean {
+    return isEncryptedEnvelope(json);
+  }
+
+  /** Decrypts (if needed) and validates a backup without changing anything. */
+  async previewBackup(json: string, password?: string) {
+    const plain = await this.unwrapBackup(json, password);
+    return parseBackup(plain);
+  }
+
+  private async unwrapBackup(json: string, password?: string): Promise<string> {
+    if (!isEncryptedEnvelope(json)) return json;
+    if (!password) throw new BackupError('This backup is password-protected. Enter its password to restore it.');
+    try {
+      return await decryptWithPassword(json, password);
+    } catch (error) {
+      throw new BackupError(error instanceof DecryptionError ? error.message : 'Could not decrypt the backup.');
+    }
+  }
+
+  async restoreBackupJson(json: string, password?: string): Promise<BackupSummary> {
+    const backup = parseBackup(await this.unwrapBackup(json, password));
     // Cancel notifications that belong to the data being replaced.
     for (const r of await this.repo.listReminders('scheduled')) {
       if (r.notificationId) await this.safeCancel(r.notificationId);
     }
     const summary = await restoreBackup(this.db, this.repo, this.files, backup);
+    // Secret items arrive decrypted inside password backups; seal them with this device's key.
+    if (this.vault.supported) await this.vault.resealPending();
     await this.resyncNotifications();
     this.notifyChanged();
+    void this.processOcrQueue();
+    void this.previews.processQueue();
     return summary;
+  }
+
+  /** Writes a weekly backup to the folder the user chose, when one is due. */
+  async runAutoBackupIfDue(force = false): Promise<boolean> {
+    const writer = this.extras.backupWriter;
+    const folder = await this.repo.getSetting(SETTINGS.autoBackupUri);
+    if (!writer || !folder) return false;
+    const last = Number((await this.repo.getSetting(SETTINGS.lastAutoBackup)) ?? 0);
+    if (!force && this.now() - last < WEEK) return false;
+    const { json } = await this.exportBackupJson();
+    const d = new Date(this.now());
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const name = `pocketvault-auto-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.json`;
+    await writer.write(folder, name, json);
+    await this.repo.setSetting(SETTINGS.lastAutoBackup, String(this.now()));
+    this.notifyChanged();
+    return true;
   }
 
   async eraseAllData(): Promise<void> {

@@ -2,14 +2,17 @@ import Constants from 'expo-constants';
 import * as DocumentPicker from 'expo-document-picker';
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
-import { ActivityIndicator, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Platform, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useLiveQuery, useServices } from '../app-state/AppContext';
 import { errorMessage, useDialog } from '../components/DialogProvider';
 import { Group, ListRow, SectionTitle, Segmented } from '../components/ui';
-import { BackupSummary, parseBackup, summarize } from '../services/backup';
+import { authSupported, authenticate, canAuthenticate } from '../security/auth';
+import { SETTINGS } from '../services/appServices';
+import { BackupSummary, summarize } from '../services/backup';
 import { openAppSettings, shareFile } from '../services/itemActions';
-import { readExternalText, saveToPickedFolder, writeCacheFile } from '../services/nativeFileStore';
+import { pickBackupFolder, readExternalText, saveToPickedFolder, writeCacheFile } from '../services/nativeFileStore';
+import { formatDateTime } from '../lib/dates';
 import { useTheme } from '../theme/ThemeProvider';
 import type { ThemePreference } from '../theme/theme';
 import { font, spacing } from '../theme/theme';
@@ -30,7 +33,7 @@ function describe(s: BackupSummary): string {
 function backupFileName() {
   const d = new Date();
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `stash-backup-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
+  return `pocketvault-backup-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
 }
 
 export default function SettingsScreen() {
@@ -51,6 +54,72 @@ export default function SettingsScreen() {
     return { items, collections: collections.length, tags: tags.length, reminders: reminders.length };
   }, []);
   const permission = useLiveQuery(() => services.notifier.getPermission(), []);
+  const prefs = useLiveQuery(async () => {
+    const [appLock, lockTimeout, quickSave, autoUri, autoLabel, lastAuto, secrets] = await Promise.all([
+      services.repo.getSetting(SETTINGS.appLock),
+      services.repo.getSetting(SETTINGS.lockTimeout),
+      services.repo.getSetting(SETTINGS.quickSave),
+      services.repo.getSetting(SETTINGS.autoBackupUri),
+      services.repo.getSetting(SETTINGS.autoBackupLabel),
+      services.repo.getSetting(SETTINGS.lastAutoBackup),
+      services.repo.countSecretItems(),
+    ]);
+    return { appLock: appLock === '1', lockTimeout: lockTimeout ?? '30', quickSave: quickSave === '1', autoUri, autoLabel, lastAuto: Number(lastAuto ?? 0), secrets };
+  }, []);
+
+  const setPref = async (key: string, value: string) => {
+    await services.repo.setSetting(key, value);
+    services.notifyChanged();
+  };
+
+  const toggleAppLock = async (on: boolean) => {
+    if (on) {
+      if (!(await canAuthenticate())) {
+        dialog.toast('Set up a fingerprint, PIN or pattern in Android settings first.', 'error');
+        return;
+      }
+      const res = await authenticate('Confirm to turn on app lock');
+      if (!res.ok) {
+        if (res.error) dialog.toast(res.error, 'error');
+        return;
+      }
+    }
+    await setPref(SETTINGS.appLock, on ? '1' : '0');
+    dialog.toast(on ? 'App lock on 🔒' : 'App lock off');
+  };
+
+  const askBackupPassword = async (): Promise<string | null | undefined> => {
+    const protect = await dialog.confirm({
+      title: 'Protect with a password?',
+      message:
+        prefs.data?.secrets
+          ? `A password encrypts the backup and also includes your ${prefs.data.secrets} secret vault item${prefs.data.secrets === 1 ? '' : 's'}. Without one, secret items are left out.`
+          : 'A password encrypts the backup file so only you can restore it.',
+      confirmLabel: 'Add password',
+      cancelLabel: 'No password',
+    });
+    if (!protect) return null;
+    const pw = await dialog.prompt({ title: 'Backup password', message: 'At least 6 characters. You will need it to restore.', secure: true, maxLength: 128, validate: (v) => (v.length < 6 ? 'Use at least 6 characters.' : null) });
+    if (!pw) return undefined;
+    const again = await dialog.prompt({ title: 'Repeat password', secure: true, maxLength: 128 });
+    if (again === null) return undefined;
+    if (again !== pw) {
+      dialog.toast('Passwords did not match — backup not created.', 'error');
+      return undefined;
+    }
+    return pw;
+  };
+
+  const turnOnAutoBackup = async () => {
+    const folder = await pickBackupFolder();
+    if (!folder) return;
+    await services.repo.setSetting(SETTINGS.autoBackupUri, folder.uri);
+    await services.repo.setSetting(SETTINGS.autoBackupLabel, folder.label);
+    await withBusy('auto', async () => {
+      await services.runAutoBackupIfDue(true);
+      dialog.toast(`Weekly backups will be saved to “${folder.label}”`);
+    });
+  };
 
   const withBusy = async (label: string, fn: () => Promise<void>) => {
     setBusy(label);
@@ -65,8 +134,11 @@ export default function SettingsScreen() {
 
   const exportBackup = (mode: 'share' | 'save') =>
     withBusy('export', async () => {
-      const { json, summary } = await services.exportBackupJson(APP_VERSION);
-      const name = backupFileName();
+      const password = Platform.OS === 'web' ? null : await askBackupPassword();
+      if (password === undefined) return;
+      const { json, summary } = await services.exportBackupJson(APP_VERSION, password ? { password } : {});
+      const name = password ? backupFileName().replace('.json', '-protected.json') : backupFileName();
+      if (summary.excludedSecrets) dialog.toast(`${summary.excludedSecrets} secret item(s) not included — add a password to include them.`);
       const missing = summary.missingFiles ? ` (${summary.missingFiles} missing file${summary.missingFiles === 1 ? '' : 's'} skipped)` : '';
       if (Platform.OS === 'web') {
         writeCacheFile(name, json);
@@ -79,7 +151,7 @@ export default function SettingsScreen() {
         return;
       }
       const uri = writeCacheFile(name, json);
-      const shared = await shareFile(uri, 'application/json', 'Save Stash backup');
+      const shared = await shareFile(uri, 'application/json', 'Save PocketVault backup');
       if (!shared) dialog.toast('Sharing is not available — use “Save backup to a folder” instead.', 'error');
     });
 
@@ -91,15 +163,21 @@ export default function SettingsScreen() {
       });
       if (result.canceled) return;
       const json = await readExternalText(result.assets[0].uri);
-      const summary = summarize(parseBackup(json));
+      let password: string | undefined;
+      if (services.isEncryptedBackup(json)) {
+        const pw = await dialog.prompt({ title: 'Password-protected backup', message: 'Enter the password used when this backup was created.', secure: true, maxLength: 128 });
+        if (!pw) return;
+        password = pw;
+      }
+      const summary = summarize(await services.previewBackup(json, password));
       const ok = await dialog.confirm({
         title: 'Restore this backup?',
-        message: `This backup contains ${describe(summary)}. Restoring replaces everything currently in Stash on this device.`,
+        message: `This backup contains ${describe(summary)}. Restoring replaces everything currently in PocketVault on this device.`,
         confirmLabel: 'Restore',
         destructive: true,
       });
       if (!ok) return;
-      const restored = await services.restoreBackupJson(json);
+      const restored = await services.restoreBackupJson(json, password);
       dialog.toast(
         `Restored ${describe(restored)}${restored.missingFiles ? `. ${restored.missingFiles} file(s) were missing from the backup.` : ''}`,
       );
@@ -156,8 +234,52 @@ export default function SettingsScreen() {
         ]}
       />
 
+      {authSupported ? (
+        <>
+          <SectionTitle>Security</SectionTitle>
+          <Group>
+            <ListRow
+              testID="app-lock-row"
+              icon="finger-print"
+              title="App lock"
+              subtitle="Fingerprint, face or screen lock when opening PocketVault"
+              right={<Switch testID="app-lock-switch" accessibilityLabel="App lock" value={!!prefs.data?.appLock} onValueChange={toggleAppLock} trackColor={{ true: colors.primary, false: colors.border }} />}
+            />
+            {prefs.data?.appLock ? (
+              <View style={{ padding: spacing.md }}>
+                <Text style={[font.small, { color: colors.textMuted, marginBottom: spacing.sm }]}>Lock after leaving the app for</Text>
+                <Segmented
+                  testIDPrefix="lock-timeout"
+                  value={prefs.data.lockTimeout}
+                  onChange={(v) => setPref(SETTINGS.lockTimeout, v)}
+                  options={[
+                    { value: '0', label: 'Instantly' },
+                    { value: '30', label: '30 sec' },
+                    { value: '300', label: '5 min' },
+                  ]}
+                />
+              </View>
+            ) : null}
+            <Divider />
+            <ListRow testID="nav-vault-settings" icon="lock-closed-outline" title="Secret vault" subtitle={`${prefs.data?.secrets ?? 0} encrypted item${prefs.data?.secrets === 1 ? '' : 's'}`} onPress={() => router.push('/vault')} />
+          </Group>
+
+          <SectionTitle>Capture</SectionTitle>
+          <Group>
+            <ListRow
+              icon="flash-outline"
+              title="Quick save from share"
+              subtitle="Save shared links and files instantly, without the review screen"
+              right={<Switch testID="quick-save-switch" accessibilityLabel="Quick save from share" value={!!prefs.data?.quickSave} onValueChange={(v) => setPref(SETTINGS.quickSave, v ? '1' : '0')} trackColor={{ true: colors.primary, false: colors.border }} />}
+            />
+          </Group>
+        </>
+      ) : null}
+
       <SectionTitle>Organize</SectionTitle>
       <Group>
+        <ListRow testID="nav-insights-settings" icon="stats-chart-outline" title="Insights" subtitle="Stats, activity and spending" onPress={() => router.push('/insights')} />
+        <Divider />
         <ListRow testID="nav-collections" icon="folder-outline" title="Collections" subtitle={stats.data ? `${stats.data.collections}` : undefined} onPress={() => router.push('/collections')} />
         <Divider />
         <ListRow testID="nav-tags" icon="pricetags-outline" title="Tags" subtitle={stats.data ? `${stats.data.tags}` : undefined} onPress={() => router.push('/tags')} />
@@ -182,7 +304,7 @@ export default function SettingsScreen() {
           <ListRow testID="backup-export" icon="download-outline" title="Download backup" subtitle="Saves a .json file with your data" onPress={() => exportBackup('share')} right={busy === 'export' ? <ActivityIndicator color={colors.primary} /> : undefined} />
         ) : (
           <>
-            <ListRow testID="backup-save" icon="folder-open-outline" title="Save backup to a folder" subtitle="Pick or create a folder (e.g. Download/Stash backups)" onPress={() => exportBackup('save')} right={busy === 'export' ? <ActivityIndicator color={colors.primary} /> : undefined} />
+            <ListRow testID="backup-save" icon="folder-open-outline" title="Save backup to a folder" subtitle="Pick or create a folder (e.g. Download/PocketVault backups)" onPress={() => exportBackup('save')} right={busy === 'export' ? <ActivityIndicator color={colors.primary} /> : undefined} />
             <Divider />
             <ListRow testID="backup-share" icon="share-outline" title="Share backup" subtitle="Send it to Drive, email or another app" onPress={() => exportBackup('share')} />
           </>
@@ -190,8 +312,31 @@ export default function SettingsScreen() {
         <Divider />
         <ListRow testID="backup-import" icon="cloud-upload-outline" title="Restore from backup" subtitle="Replaces the data on this device" onPress={importBackup} right={busy === 'import' ? <ActivityIndicator color={colors.primary} /> : undefined} />
       </Group>
+      {Platform.OS !== 'web' ? (
+        <View style={{ marginTop: spacing.md }}>
+          <Group>
+            {prefs.data?.autoUri ? (
+              <>
+                <ListRow
+                  testID="auto-backup-row"
+                  icon="time-outline"
+                  title="Weekly automatic backup"
+                  subtitle={`To “${prefs.data.autoLabel ?? 'folder'}”${prefs.data.lastAuto ? ` · last ${formatDateTime(prefs.data.lastAuto)}` : ''}`}
+                  right={busy === 'auto' ? <ActivityIndicator color={colors.primary} /> : null}
+                />
+                <Divider />
+                <ListRow icon="cloud-done-outline" title="Back up now" onPress={() => withBusy('auto', async () => { await services.runAutoBackupIfDue(true); dialog.toast('Backup saved'); })} />
+                <Divider />
+                <ListRow icon="close-circle-outline" title="Turn off automatic backup" destructive onPress={() => setPref(SETTINGS.autoBackupUri, '')} />
+              </>
+            ) : (
+              <ListRow testID="auto-backup-on" icon="time-outline" title="Turn on weekly automatic backup" subtitle="Saved automatically to a folder you choose" onPress={turnOnAutoBackup} />
+            )}
+          </Group>
+        </View>
+      ) : null}
       <Text style={[font.small, styles.hint, { color: colors.textFaint }]}>
-        Backups include items, files, collections, tags, reminders and settings. Keep them somewhere safe — Stash has no cloud copy.
+        Backups include items, files, collections, tags, reminders and settings. Keep them somewhere safe — PocketVault has no cloud copy.
       </Text>
 
       <SectionTitle>Data</SectionTitle>
@@ -208,7 +353,7 @@ export default function SettingsScreen() {
       </Group>
 
       <Text style={[font.small, styles.about, { color: colors.textFaint }]}>
-        Stash {APP_VERSION} · Works fully offline · No account, no tracking
+        PocketVault {APP_VERSION} · Works fully offline · No account, no tracking
       </Text>
     </ScrollView>
   );

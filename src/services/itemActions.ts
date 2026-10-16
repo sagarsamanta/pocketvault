@@ -32,11 +32,14 @@ export async function openUrl(url: string): Promise<void> {
   }
 }
 
-/** Opens an attachment in another app using a content:// URI with read permission. */
-export async function openAttachment(files: FileStore, attachment: Attachment): Promise<void> {
+/**
+ * Opens an attachment in another app using a content:// URI with read permission.
+ * `uri` overrides the stored file (e.g. a decrypted vault copy).
+ */
+export async function openAttachment(files: FileStore, attachment: Attachment, uri?: string): Promise<void> {
   const path = attachmentPath(attachment.fileName);
-  if (!(await files.exists(path))) throw new Error('This file is missing from the device.');
-  const file = new File(files.uri(path));
+  if (!uri && !(await files.exists(path))) throw new Error('This file is missing from the device.');
+  const file = new File(uri ?? files.uri(path));
   try {
     await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
       data: file.contentUri,
@@ -48,12 +51,12 @@ export async function openAttachment(files: FileStore, attachment: Attachment): 
   }
 }
 
-export async function shareItem(files: FileStore, item: Item, attachment?: Attachment): Promise<void> {
+export async function shareItem(files: FileStore, item: Item, attachment?: Attachment, uri?: string): Promise<void> {
   if (attachment) {
     const path = attachmentPath(attachment.fileName);
-    if (!(await files.exists(path))) throw new Error('This file is missing from the device.');
+    if (!uri && !(await files.exists(path))) throw new Error('This file is missing from the device.');
     if (!(await Sharing.isAvailableAsync())) throw new Error('Sharing is not available on this device.');
-    await Sharing.shareAsync(files.uri(path), { mimeType: attachment.mimeType, dialogTitle: item.title || 'Share' });
+    await Sharing.shareAsync(uri ?? files.uri(path), { mimeType: attachment.mimeType, dialogTitle: item.title || 'Share' });
     return;
   }
   await Share.share({ message: itemText(item), title: item.title || undefined });

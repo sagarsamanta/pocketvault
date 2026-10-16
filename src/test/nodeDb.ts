@@ -65,7 +65,7 @@ export class TempFileStore implements FileStore {
   readonly root: string;
 
   constructor() {
-    this.root = fs.mkdtempSync(path.join(os.tmpdir(), 'stash-test-'));
+    this.root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketvault-test-'));
   }
 
   private abs(p: string) {

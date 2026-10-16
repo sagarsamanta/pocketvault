@@ -35,12 +35,14 @@ export interface AsyncData<T> {
 /**
  * Loads data with `load` and reloads it whenever the database changes or `deps` change.
  * Keeps showing the previous data while reloading to avoid flicker.
- * `deps` must be primitives (they also form the request key).
+ * `deps` form the request key; objects are compared by their JSON content.
  */
 export function useLiveQuery<T>(load: () => Promise<T>, deps: DependencyList): AsyncData<T> {
   const version = useDataVersion();
   const [nonce, setNonce] = useState(0);
-  const key = [version, nonce, ...deps].map(String).join('\u0001');
+  const key = [version, nonce, ...deps]
+    .map((d) => (d !== null && typeof d === 'object' ? JSON.stringify(d) : String(d)))
+    .join('\u0001');
   const [state, setState] = useState<{ data: T | undefined; error: Error | null; key: string | null }>({
     data: undefined,
     error: null,

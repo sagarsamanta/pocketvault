@@ -1,16 +1,21 @@
 import { Stack, useLocalSearchParams, useNavigation, useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
+import Ionicons from '@expo/vector-icons/Ionicons';
+import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useLiveQuery, useServices } from '../app-state/AppContext';
 import { CollectionPicker } from '../components/CollectionPicker';
+import { ColorPicker } from '../components/ColorPicker';
+import { GradientButton } from '../components/motion';
 import { errorMessage, useDialog } from '../components/DialogProvider';
 import { TagEditor } from '../components/TagEditor';
-import { Button, ErrorView, LoadingView, Segmented, TextField } from '../components/ui';
-import type { ItemType } from '../db/types';
+import { ErrorView, LoadingView, Segmented, TextField } from '../components/ui';
+import type { ItemColor, ItemType } from '../db/types';
+import { applyFormat } from '../lib/checklist';
+import { haptic } from '../lib/haptics';
 import { normalizeUrl } from '../lib/text';
 import { useTheme } from '../theme/ThemeProvider';
-import { font, spacing } from '../theme/theme';
+import { font, radius, spacing } from '../theme/theme';
 
 /** Creates a note or link, or edits any existing item (`?id=`). */
 export default function EditScreen() {
@@ -22,10 +27,11 @@ export default function EditScreen() {
   const insets = useSafeAreaInsets();
   const editingId = params.id || null;
 
-  const existing = useLiveQuery(
-    () => (editingId ? services.repo.getItemWithRelations(editingId) : Promise.resolve(null)),
-    [editingId],
-  );
+  const existing = useLiveQuery(async () => {
+    if (!editingId) return null;
+    const raw = await services.repo.getItemWithRelations(editingId);
+    return raw?.isSecret ? services.vault.getSecretItem(editingId) : raw;
+  }, [editingId]);
   const collections = useLiveQuery(() => services.repo.listCollections(), []);
   const allTags = useLiveQuery(() => services.repo.listTags(), []);
 
@@ -36,6 +42,9 @@ export default function EditScreen() {
   const [collectionId, setCollectionId] = useState<string | null>(params.collection || null);
   const [tags, setTags] = useState<string[]>([]);
   const [favorite, setFavorite] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const [color, setColor] = useState<ItemColor | null>(null);
+  const [selection, setSelection] = useState({ start: 0, end: 0 });
   const [saving, setSaving] = useState(false);
   const [urlError, setUrlError] = useState<string | null>(null);
   const loaded = useRef(false);
@@ -52,6 +61,8 @@ export default function EditScreen() {
     setCollectionId(item.collectionId);
     setTags(item.tags.map((t) => t.name));
     setFavorite(item.isFavorite);
+    setPinned(item.isPinned);
+    setColor(item.color);
   }, [existing.data]);
 
   // Ask before discarding unsaved changes (hardware back, header back, swipe).
@@ -66,6 +77,8 @@ export default function EditScreen() {
         url !== (initial.url ?? '') ||
         collectionId !== initial.collectionId ||
         favorite !== initial.isFavorite ||
+        pinned !== initial.isPinned ||
+        color !== initial.color ||
         tags.join('\u0001') !== initial.tags.map((t) => t.name).join('\u0001'))
     : !!(title.trim() || note.trim() || url.trim() || tags.length);
   useEffect(() => {
@@ -123,6 +136,23 @@ export default function EditScreen() {
       setUrlError('This does not look like a valid link.');
       return;
     }
+    // Warn before saving the same page twice.
+    if (cleanUrl && (isNew || cleanUrl !== (initial?.url ?? '')) && !initial?.isSecret) {
+      const dupes = await services.findDuplicateLinks(cleanUrl, editingId ?? undefined);
+      if (dupes.length) {
+        const saveAnyway = await dialog.confirm({
+          title: 'Already in your vault',
+          message: `You saved this link before${dupes[0].title ? ` as “${dupes[0].title}”` : ''}. Save it again?`,
+          confirmLabel: 'Save anyway',
+          cancelLabel: 'Open existing',
+        });
+        if (!saveAnyway) {
+          allowLeave.current = true;
+          router.replace({ pathname: '/item/[id]', params: { id: dupes[0].id } });
+          return;
+        }
+      }
+    }
     setSaving(true);
     try {
       if (isNew) {
@@ -133,14 +163,24 @@ export default function EditScreen() {
           url: cleanUrl || null,
           collectionId,
           isFavorite: favorite,
+          isPinned: pinned,
+          color,
           tagNames: tags,
           source: 'manual',
         });
+        haptic.success();
         allowLeave.current = true;
         router.replace({ pathname: '/item/[id]', params: { id: item.id } });
+      } else if (initial?.isSecret) {
+        await services.vault.updateSecret(editingId!, { title, note, url: cleanUrl || null });
+        await services.updateItem(editingId!, { isFavorite: favorite, color });
+        haptic.success();
+        allowLeave.current = true;
+        router.back();
       } else {
-        await services.updateItem(editingId!, { title, note, url: cleanUrl || null, collectionId, isFavorite: favorite });
+        await services.updateItem(editingId!, { title, note, url: cleanUrl || null, collectionId, isFavorite: favorite, isPinned: pinned, color });
         await services.setTags(editingId!, tags);
+        haptic.success();
         allowLeave.current = true;
         router.back();
       }
@@ -197,22 +237,61 @@ export default function EditScreen() {
           returnKeyType="next"
           onSubmitEditing={() => noteRef.current?.focus()}
         />
-        <TextField
-          ref={noteRef}
-          testID="input-note"
-          label={type === 'link' ? 'Notes' : 'Note'}
-          value={note}
-          onChangeText={setNote}
-          placeholder="Write anything…"
-          multiline
-        />
-        <CollectionPicker
-          collections={collections.data ?? []}
-          value={collectionId}
-          onChange={setCollectionId}
-          onCreate={createCollection}
-        />
-        <TagEditor value={tags} onChange={setTags} allTags={allTags.data ?? []} />
+        <View style={{ gap: spacing.sm }}>
+          <TextField
+            ref={noteRef}
+            testID="input-note"
+            label={type === 'link' ? 'Notes' : 'Note'}
+            value={note}
+            onChangeText={(text) => {
+              // Keep the cursor estimate in sync while typing (web does not report every move).
+              const delta = text.length - note.length;
+              setNote(text);
+              setSelection((s) => {
+                const pos = Math.max(0, Math.min(text.length, s.end + delta));
+                return { start: pos, end: pos };
+              });
+            }}
+            onSelectionChange={(e) => setSelection(e.nativeEvent.selection)}
+            placeholder="Write anything… use the toolbar for checklists"
+            multiline
+          />
+          <View style={[styles.toolbar, { backgroundColor: colors.surfaceAlt }]} accessibilityRole="toolbar">
+            {(
+              [
+                ['check', 'checkbox-outline', 'Checklist item'],
+                ['heading', 'text', 'Heading'],
+                ['bullet', 'list', 'Bullet'],
+                ['bold', 'brush', 'Bold'],
+              ] as const
+            ).map(([f, icon, label]) => (
+              <Pressable
+                key={f}
+                testID={`format-${f}`}
+                accessibilityRole="button"
+                accessibilityLabel={label}
+                onPress={() => {
+                  haptic.tap();
+                  const next = applyFormat(note, selection, f);
+                  setNote(next.text);
+                  setSelection({ start: next.cursor, end: next.cursor });
+                  noteRef.current?.focus();
+                }}
+                style={styles.toolBtn}
+              >
+                <Ionicons name={icon} size={20} color={colors.primary} />
+                <Text style={{ color: colors.textMuted, fontSize: 11, fontWeight: '600' }}>{label.split(' ')[0]}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+        {!initial?.isSecret ? (
+          <>
+            <CollectionPicker collections={collections.data ?? []} value={collectionId} onChange={setCollectionId} onCreate={createCollection} />
+            <TagEditor value={tags} onChange={setTags} allTags={allTags.data ?? []} />
+          </>
+        ) : null}
+        <ColorPicker value={color} onChange={setColor} />
         <View style={[styles.switchRow, { borderColor: colors.border }]}>
           <Text style={[font.body, { color: colors.text, flex: 1 }]}>Favorite</Text>
           <Switch
@@ -224,7 +303,20 @@ export default function EditScreen() {
             thumbColor={Platform.OS === 'android' ? colors.surface : undefined}
           />
         </View>
-        <Button testID="save-item" label={isNew ? 'Save' : 'Save changes'} icon="checkmark" onPress={save} loading={saving} />
+        {!initial?.isSecret ? (
+          <View style={[styles.switchRow, { borderColor: colors.border }]}>
+            <Text style={[font.body, { color: colors.text, flex: 1 }]}>Pin to top</Text>
+            <Switch
+              testID="input-pinned"
+              accessibilityLabel="Pin to top"
+              value={pinned}
+              onValueChange={setPinned}
+              trackColor={{ true: colors.accent, false: colors.border }}
+              thumbColor={Platform.OS === 'android' ? colors.surface : undefined}
+            />
+          </View>
+        ) : null}
+        <GradientButton testID="save-item" label={saving ? 'Saving…' : isNew ? 'Save' : 'Save changes'} icon="checkmark" onPress={save} disabled={saving} />
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -233,4 +325,6 @@ export default function EditScreen() {
 const styles = StyleSheet.create({
   content: { padding: spacing.lg, gap: spacing.lg, width: '100%', maxWidth: 760, alignSelf: 'center' },
   switchRow: { flexDirection: 'row', alignItems: 'center', minHeight: 48 },
+  toolbar: { flexDirection: 'row', borderRadius: radius.md, padding: 4, gap: 4 },
+  toolBtn: { flex: 1, minHeight: 48, alignItems: 'center', justifyContent: 'center', borderRadius: radius.sm, gap: 2 },
 });

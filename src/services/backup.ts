@@ -2,8 +2,8 @@ import { Database, SqlParam } from '../db/adapter';
 import { Repository } from '../db/repository';
 import { ATTACHMENTS_DIR, FileStore, RESTORE_STAGING_DIR, attachmentPath } from './fileStore';
 
-export const BACKUP_FORMAT = 'stash-backup';
-export const BACKUP_VERSION = 1;
+export const BACKUP_FORMAT = 'pocketvault-backup';
+export const BACKUP_VERSION = 2;
 const PENDING_RESTORE_KEY = 'pending_restore';
 
 /** Settings that describe this device rather than the user's content are not backed up. */
@@ -28,24 +28,60 @@ const TABLES: TableSpec[] = [
       'title',
       'note',
       'url',
+      'canonical_url',
       'content_text',
       'collection_id',
       'is_favorite',
+      'is_pinned',
+      'color',
+      'is_secret',
+      'secret_payload',
       'ocr_status',
       'ocr_error',
+      'preview_status',
+      'preview_title',
+      'preview_description',
+      'preview_site',
+      'reader_text',
       'source',
       'created_at',
       'updated_at',
     ],
   },
-  { name: 'attachments', columns: ['id', 'item_id', 'file_name', 'original_name', 'mime_type', 'size', 'created_at'] },
+  {
+    name: 'attachments',
+    columns: ['id', 'item_id', 'file_name', 'original_name', 'mime_type', 'size', 'role', 'duration_ms', 'encrypted', 'created_at'],
+  },
   { name: 'item_tags', columns: ['item_id', 'tag_id'] },
+  { name: 'item_facts', columns: ['item_id', 'kind', 'value', 'num', 'created_at'] },
   {
     name: 'reminders',
     columns: ['id', 'item_id', 'remind_at', 'status', 'notification_id', 'created_at', 'updated_at'],
   },
   { name: 'settings', columns: ['key', 'value'] },
 ];
+
+/** Values for columns that older backups (v1) do not contain. */
+const COLUMN_DEFAULTS: Record<string, Record<string, SqlParam>> = {
+  items: { is_pinned: 0, is_secret: 0, preview_status: 'none', reader_text: '', content_text: '', note: '', title: '' },
+  attachments: { role: 'file', encrypted: 0 },
+  item_facts: {},
+};
+
+/** Tables whose rows belong to an item (dropped together with excluded secret items). */
+const ITEM_CHILD_TABLES = ['attachments', 'item_tags', 'item_facts', 'reminders'];
+
+/**
+ * Optional hooks for secret items. Without them, secret items are left out of the backup.
+ * With them (password-protected backups), secrets are exported decrypted inside the
+ * encrypted file and re-encrypted with the device key on restore.
+ */
+export interface SecretExport {
+  /** Returns the item row with its plaintext fields restored. */
+  decryptItem(row: Row): Promise<Row>;
+  /** Returns the decrypted content of an encrypted attachment file as base64. */
+  decryptFile(fileName: string): Promise<string>;
+}
 
 export interface BackupFile {
   format: typeof BACKUP_FORMAT;
@@ -56,6 +92,8 @@ export interface BackupFile {
   /** Attachment file contents keyed by file name, base64 encoded. */
   files: Record<string, string>;
   missingFiles: string[];
+  /** Secret items that were deliberately left out (plain backups). */
+  excludedSecrets?: number;
 }
 
 export interface BackupSummary {
@@ -65,6 +103,8 @@ export interface BackupSummary {
   reminders: number;
   attachments: number;
   missingFiles: number;
+  secretItems?: number;
+  excludedSecrets?: number;
 }
 
 export class BackupError extends Error {
@@ -82,34 +122,54 @@ export function summarize(backup: BackupFile): BackupSummary {
     reminders: backup.tables.reminders?.length ?? 0,
     attachments: backup.tables.attachments?.length ?? 0,
     missingFiles: backup.missingFiles.length,
+    secretItems: (backup.tables.items ?? []).filter((r) => Number(r.is_secret) === 1).length,
+    excludedSecrets: backup.excludedSecrets ?? 0,
   };
 }
 
-export async function createBackup(db: Database, files: FileStore, appVersion = '1.0.0'): Promise<BackupFile> {
+export async function createBackup(
+  db: Database,
+  files: FileStore,
+  appVersion = '1.0.0',
+  secrets?: SecretExport,
+): Promise<BackupFile> {
   const tables: Record<string, Row[]> = {};
   for (const t of TABLES) {
     const rows = await db.all<Row>(`SELECT ${t.columns.join(', ')} FROM ${t.name}`);
     tables[t.name] = t.name === 'settings' ? rows.filter((r) => !DEVICE_SETTINGS.has(String(r.key))) : rows;
+  }
+  const secretIds = new Set(tables.items.filter((r) => Number(r.is_secret) === 1).map((r) => String(r.id)));
+  let excludedSecrets = 0;
+  if (secretIds.size && !secrets) {
+    excludedSecrets = secretIds.size;
+    tables.items = tables.items.filter((r) => !secretIds.has(String(r.id)));
+    for (const t of ITEM_CHILD_TABLES) tables[t] = tables[t].filter((r) => !secretIds.has(String(r.item_id)));
+  } else if (secretIds.size && secrets) {
+    tables.items = await Promise.all(tables.items.map((r) => (secretIds.has(String(r.id)) ? secrets.decryptItem(r) : r)));
   }
   const fileContents: Record<string, string> = {};
   const missingFiles: string[] = [];
   for (const att of tables.attachments) {
     const name = String(att.file_name);
     const path = attachmentPath(name);
-    if (files.supported && (await files.exists(path))) {
-      fileContents[name] = await files.readBase64(path);
-    } else {
+    if (!files.supported || !(await files.exists(path))) {
       missingFiles.push(name);
+    } else if (Number(att.encrypted) === 1 && secrets) {
+      fileContents[name] = await secrets.decryptFile(name);
+      att.encrypted = 0; // stored decrypted inside the (password-encrypted) backup
+    } else {
+      fileContents[name] = await files.readBase64(path);
     }
   }
   return {
     format: BACKUP_FORMAT,
     version: BACKUP_VERSION,
     exportedAt: new Date().toISOString(),
-    app: `Stash ${appVersion}`,
+    app: `PocketVault ${appVersion}`,
     tables,
     files: fileContents,
     missingFiles,
+    excludedSecrets,
   };
 }
 
@@ -121,14 +181,14 @@ export function parseBackup(json: string): BackupFile {
   try {
     data = JSON.parse(json);
   } catch {
-    throw new BackupError('This file is not a valid Stash backup (could not read JSON).');
+    throw new BackupError('This file is not a valid PocketVault backup (could not read JSON).');
   }
   const b = data as Partial<BackupFile>;
   if (!b || typeof b !== 'object' || b.format !== BACKUP_FORMAT) {
-    throw new BackupError('This file is not a Stash backup.');
+    throw new BackupError('This file is not a PocketVault backup.');
   }
   if (typeof b.version !== 'number' || b.version > BACKUP_VERSION) {
-    throw new BackupError('This backup was made by a newer version of Stash. Update the app to restore it.');
+    throw new BackupError('This backup was made by a newer version of PocketVault. Update the app to restore it.');
   }
   if (!b.tables || typeof b.tables !== 'object') throw new BackupError('The backup is missing its data.');
   for (const t of TABLES) {
@@ -164,6 +224,7 @@ export function parseBackup(json: string): BackupFile {
     tables: b.tables as Record<string, Row[]>,
     files: files as Record<string, string>,
     missingFiles: Array.isArray(b.missingFiles) ? b.missingFiles.map(String) : [],
+    excludedSecrets: typeof b.excludedSecrets === 'number' ? b.excludedSecrets : 0,
   };
 }
 
@@ -205,7 +266,9 @@ export async function restoreBackup(
         for (const row of backup.tables[t.name] ?? []) {
           if (t.name === 'settings' && DEVICE_SETTINGS.has(String(row.key))) continue;
           // Notifications from another install are not valid here; they are rescheduled after restore.
-          const values = t.columns.map((c) => (t.name === 'reminders' && c === 'notification_id' ? null : row[c] ?? null));
+          const values = t.columns.map((c) =>
+            t.name === 'reminders' && c === 'notification_id' ? null : row[c] ?? COLUMN_DEFAULTS[t.name]?.[c] ?? null,
+          );
           await db.run(sql, values);
         }
       }

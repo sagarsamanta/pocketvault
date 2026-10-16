@@ -22,6 +22,9 @@ interface PromptOptions {
   placeholder?: string;
   confirmLabel?: string;
   validate?: (value: string) => string | null;
+  /** Hide the typed text (passwords). */
+  secure?: boolean;
+  maxLength?: number;
 }
 
 interface DialogApi {
@@ -148,7 +151,10 @@ export function DialogProvider({ children }: { children: ReactNode }) {
                       placeholder={dialog.options.placeholder}
                       error={error}
                       autoFocus
-                      maxLength={40}
+                      maxLength={dialog.options.maxLength ?? 40}
+                      secureTextEntry={!!dialog.options.secure}
+                      autoCapitalize={dialog.options.secure ? 'none' : undefined}
+                      autoCorrect={!dialog.options.secure}
                       returnKeyType="done"
                       onSubmitEditing={() => close(true)}
                     />

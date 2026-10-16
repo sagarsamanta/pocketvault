@@ -5,8 +5,10 @@ import { initDatabase } from '../db/openDatabase';
 import { AppServices } from '../services/appServices';
 import { nativeFileStore } from '../services/nativeFileStore';
 import { notifier, ocrEngine } from '../services/platform';
+import { createPlatformExtras } from '../services/platformExtras';
+import { DATABASE_NAME } from './dbName';
 
-export const DATABASE_NAME = 'stash.db';
+export { DATABASE_NAME };
 
 function expoDriver(db: SQLite.SQLiteDatabase): DbDriver {
   return {
@@ -32,7 +34,7 @@ async function openDatabase(): Promise<SQLite.SQLiteDatabase> {
     } catch (error) {
       if (!isLockError(error) || i >= attempts) {
         if (isLockError(error)) {
-          throw new Error('Stash is already open in another browser tab. Close it and try again.');
+          throw new Error('PocketVault is already open in another browser tab. Close it and try again.');
         }
         throw error;
       }
@@ -54,7 +56,7 @@ export async function createServices(): Promise<AppServices> {
     });
   }
   const { db, repo } = await initDatabase(expoDriver(sqlite));
-  const services = new AppServices(db, repo, nativeFileStore, notifier, ocrEngine);
+  const services = new AppServices(db, repo, nativeFileStore, notifier, ocrEngine, createPlatformExtras(nativeFileStore));
   await services.startup();
   return services;
 }

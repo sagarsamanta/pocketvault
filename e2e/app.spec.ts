@@ -7,7 +7,7 @@ test.describe('first launch', () => {
     const errors = await openFresh(page);
     await expect(page.getByText('Everything you want to keep')).toBeVisible();
     await completeOnboarding(page);
-    await expect(page.getByText('Your stash is empty')).toBeVisible();
+    await expect(page.getByText('Your vault is empty')).toBeVisible();
     await page.reload();
     await expect(page.getByTestId('search-input')).toBeVisible();
     await expect(page.getByTestId('onboarding')).toHaveCount(0);
@@ -43,14 +43,14 @@ test.describe('items', () => {
     await expect(page.getByTestId('detail-title')).toBeVisible();
     await page.getByTestId('detail-delete').click();
     await confirmDialog(page);
-    await expect(page.getByText('Your stash is empty')).toBeVisible();
+    await expect(page.getByText('Your vault is empty')).toBeVisible();
     expect(errors).toEqual([]);
   });
 
   test('empty notes cannot be saved', async ({ page }) => {
     await start(page);
     await page.getByTestId('fab-add').click();
-    await page.getByTestId('add-note').click();
+    await page.getByTestId('fab-note').click();
     await page.getByTestId('save-item').click();
     await expect(page.getByTestId('toast')).toContainText('Add a title, note, link or file');
   });
@@ -58,7 +58,7 @@ test.describe('items', () => {
   test('links are validated, opened and copied', async ({ page, context }) => {
     await start(page);
     await page.getByTestId('fab-add').click();
-    await page.getByTestId('add-link').click();
+    await page.getByTestId('fab-link').click();
     await page.getByTestId('save-item').click();
     await expect(page.getByText('Enter a link to save.')).toBeVisible();
     await page.getByTestId('input-url').fill('example.com/article');
@@ -104,7 +104,7 @@ test.describe('organizing', () => {
 
     await goHome(page);
     await page.getByTestId('fab-add').click();
-    await page.getByTestId('add-note').click();
+    await page.getByTestId('fab-note').click();
     await page.getByTestId('input-title').fill('Pancakes');
     await page.getByTestId('collection-option-Recipes').click();
     await page.getByTestId('save-item').click();
@@ -251,7 +251,7 @@ test.describe('backup and settings', () => {
     const file = testInfo.outputPath('backup.json');
     await (await download).saveAs(file);
     const backup = JSON.parse(fs.readFileSync(file, 'utf8'));
-    expect(backup.format).toBe('stash-backup');
+    expect(backup.format).toBe('pocketvault-backup');
     expect(backup.tables.items).toHaveLength(1);
     expect(backup.tables.reminders).toHaveLength(1);
 
@@ -261,7 +261,7 @@ test.describe('backup and settings', () => {
     await confirmDialog(page);
     await expect(page.getByTestId('toast')).toContainText('All data erased');
     await goHome(page);
-    await expect(page.getByText('Your stash is empty')).toBeVisible();
+    await expect(page.getByText('Your vault is empty')).toBeVisible();
 
     await page.goto('/settings');
     const chooser = page.waitForEvent('filechooser');
@@ -287,7 +287,7 @@ test.describe('backup and settings', () => {
     const chooser = page.waitForEvent('filechooser');
     await page.getByTestId('backup-import').click();
     await (await chooser).setFiles(bad);
-    await expect(page.getByTestId('toast')).toContainText('not a Stash backup');
+    await expect(page.getByTestId('toast')).toContainText('not a PocketVault backup');
     await goHome(page);
     await expect(cards(page)).toHaveCount(1);
   });
@@ -328,7 +328,7 @@ test.describe('navigation and accessibility', () => {
   test('leaving the editor with unsaved changes asks first', async ({ page }) => {
     await start(page);
     await page.getByTestId('fab-add').click();
-    await page.getByTestId('add-note').click();
+    await page.getByTestId('fab-note').click();
     await page.getByTestId('input-title').fill('Draft that matters');
     const headerBack = page.getByRole('link', { name: /back/i }).last();
     await headerBack.click();
@@ -338,7 +338,7 @@ test.describe('navigation and accessibility', () => {
     await headerBack.click();
     await confirmDialog(page);
     await expect(page.getByTestId('search-input')).toBeVisible();
-    await expect(page.getByText('Your stash is empty')).toBeVisible();
+    await expect(page.getByText('Your vault is empty')).toBeVisible();
 
     // Saving never prompts.
     await createNote(page, 'Saved without prompt');

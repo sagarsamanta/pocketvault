@@ -86,16 +86,16 @@ describe('backup round trip', () => {
 describe('backup validation', () => {
   it.each([
     ['not json', /could not read JSON/],
-    ['{"format":"other"}', /not a Stash backup/],
-    ['{"format":"stash-backup","version":99,"tables":{}}', /newer version/],
-    ['{"format":"stash-backup","version":1}', /missing its data/],
-    ['{"format":"stash-backup","version":1,"tables":{"items":"x"}}', /damaged/],
-    ['{"format":"stash-backup","version":1,"tables":{"items":[{"id":{}}]}}', /damaged/],
+    ['{"format":"other"}', /not a PocketVault backup/],
+    ['{"format":"pocketvault-backup","version":99,"tables":{}}', /newer version/],
+    ['{"format":"pocketvault-backup","version":1}', /missing its data/],
+    ['{"format":"pocketvault-backup","version":1,"tables":{"items":"x"}}', /damaged/],
+    ['{"format":"pocketvault-backup","version":1,"tables":{"items":[{"id":{}}]}}', /damaged/],
     [
-      '{"format":"stash-backup","version":1,"tables":{"attachments":[{"file_name":"../../evil"}]}}',
+      '{"format":"pocketvault-backup","version":1,"tables":{"attachments":[{"file_name":"../../evil"}]}}',
       /unsafe file name/,
     ],
-    ['{"format":"stash-backup","version":1,"tables":{},"files":{"../x":"AA"}}', /damaged attachment/],
+    ['{"format":"pocketvault-backup","version":1,"tables":{},"files":{"../x":"AA"}}', /damaged attachment/],
   ])('rejects %s', (json, message) => {
     expect(() => parseBackup(json)).toThrow(BackupError);
     expect(() => parseBackup(json)).toThrow(message);

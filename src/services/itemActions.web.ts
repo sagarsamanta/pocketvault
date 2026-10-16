@@ -23,11 +23,11 @@ export async function openUrl(url: string): Promise<void> {
   await Linking.openURL(normalizeUrl(url));
 }
 
-export async function openAttachment(_files: FileStore, _attachment: Attachment): Promise<void> {
+export async function openAttachment(_files: FileStore, _attachment: Attachment, _uri?: string): Promise<void> {
   throw new Error('Opening files is only available in the Android app.');
 }
 
-export async function shareItem(_files: FileStore, item: Item, attachment?: Attachment): Promise<void> {
+export async function shareItem(_files: FileStore, item: Item, attachment?: Attachment, _uri?: string): Promise<void> {
   if (attachment) throw new Error('Sharing files is only available in the Android app.');
   const nav = globalThis.navigator as Navigator & { share?: (d: { title?: string; text: string }) => Promise<void> };
   if (nav?.share) {
